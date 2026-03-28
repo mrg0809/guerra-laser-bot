@@ -1,0 +1,41 @@
+# Bot Guerra Laser (FastAPI) + red compartida con Chatwoot
+#
+# Caso A — Chatwoot YA corre en otro stack (Portainer / otro compose):
+#   1) Descubre el nombre de la red de Chatwoot, p. ej.:
+#        docker network ls | grep -i chatwoot
+#   2) En este archivo, comenta el bloque "networks" de abajo y descomenta
+#      el bloque "external" (ajusta `name:` al nombre real de la red).
+#   3) Sube el stack: el servicio se une a la misma red que Chatwoot.
+#   4) En Chatwoot, webhook del agente/bot apunta a:
+#        http://guerra-laser-ai:8000/webhook
+#   5) En .env, CHATWOOT_BASE_URL debe ser alcanzable DESDE este contenedor:
+#        p. ej. http://rails:3000 o el nombre del servicio web de tu stack Chatwoot.
+#
+# Caso B — Todo en un solo compose (incluyes tú los servicios de Chatwoot):
+#   Añade tus servicios (postgres, redis, rails, sidekiq, etc.) y enlázalos a
+#   la red `guerra-laser-net` igual que `guerra-laser-ai`.
+
+services:
+  guerra-laser-ai:
+    build: .
+    image: guerra-laser-ai:latest
+    container_name: guerra-laser-ai
+    env_file: .env
+    ports:
+      - "${GUERRA_LASER_PORT:-8000}:8000"
+    networks:
+      - guerra-laser-net
+    restart: unless-stopped
+    # Descomenta si Chatwoot está en el host (puerto publicado) y no comparten red:
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+
+networks:
+  guerra-laser-net:
+    name: guerra-laser-net
+    driver: bridge
+
+  # Descomenta y ajusta `name` para usar la red donde ya está Chatwoot:
+  # guerra-laser-net:
+  #   external: true
+  #   name: chatwoot_default
