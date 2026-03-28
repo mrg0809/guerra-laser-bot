@@ -22,18 +22,18 @@ services:
     container_name: guerra-laser-ai
     env_file: .env
     ports:
-      - "${GUERRA_LASER_PORT:-8000}:8000"
+      - "8000:8000"
     networks:
-      - guerra-laser-net
+      - chatwoot_network
     restart: unless-stopped
     # Descomenta si Chatwoot está en el host (puerto publicado) y no comparten red:
     # extra_hosts:
     #   - "host.docker.internal:host-gateway"
 
 networks:
-  guerra-laser-net:
-    name: guerra-laser-net
-    driver: bridge
+  chatwoot_network:
+    external: true
+    name: chatwoot_default
 
   # Descomenta y ajusta `name` para usar la red donde ya está Chatwoot:
   # guerra-laser-net:
