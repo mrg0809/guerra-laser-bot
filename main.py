@@ -56,6 +56,7 @@ _gemini: GeminiService | None = None
 debouncer = ConversationDebouncer(delay_seconds=DEBOUNCE_SECONDS)
 _handover_conversations: set[int] = set()
 _introduced_conversations: set[int] = set()
+_conversation_memory: dict[int, dict[str, Any]] = {}
 
 
 def get_supabase() -> Client:
@@ -378,6 +379,25 @@ def _urls_media_relevantes_para_enviar(
     return out
 
 
+def _merge_terms(primary: list[str], fallback: list[str], max_n: int = 12) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in primary + fallback:
+        if not isinstance(t, str):
+            continue
+        x = t.strip()
+        if not x:
+            continue
+        xl = x.lower()
+        if xl in seen:
+            continue
+        seen.add(xl)
+        out.append(x)
+        if len(out) >= max_n:
+            break
+    return out
+
+
 def _terms_from_extraction(extracted: dict[str, Any]) -> list[str]:
     terms: list[str] = []
     for k in ("terminos_busqueda", "medidas_o_specs"):
@@ -669,6 +689,7 @@ async def process_conversation(
     text = accumulated.merge_text()
     images = list(accumulated.image_urls)
     fragmentos = len(accumulated.texts) if accumulated.texts else 1
+    memory = _conversation_memory.get(conversation_id, {})
     gemini = get_gemini()
     extracted = gemini.extract_technical_specs(text, images)
     intent, motivo = _intent_from_extraction(extracted, text)
@@ -692,14 +713,36 @@ async def process_conversation(
         await send_chatwoot_message(conversation_id, account_id, response)
         return
 
+    wants_photos = _quiere_fotos_desde_texto_o_extraccion(text, extracted)
     terms = _terms_from_extraction(extracted)
+    prev_terms = memory.get("last_terms") or []
+    # Seguimiento corto (ej: "tendrás fotos?"): reutiliza términos previos para no perder hilo.
+    if wants_photos and len(terms) <= 2 and isinstance(prev_terms, list):
+        terms = _merge_terms(terms, [str(t) for t in prev_terms])
+
     productos_raw = search_productos(terms)
+    if wants_photos and not productos_raw:
+        prev_productos = memory.get("last_productos_raw")
+        if isinstance(prev_productos, list) and prev_productos:
+            productos_raw = [p for p in prev_productos if isinstance(p, dict)]
+
     productos = [enrich_product_with_public_url(p) for p in productos_raw]
     categorias_de_productos = fetch_categories_with_urls_by_product_ids(productos_raw)
     categorias_por_terminos = search_categorias(terms) if not productos_raw else []
     categorias_relacionadas = _merge_categorias_por_id(categorias_de_productos + categorias_por_terminos)
 
     media_rows = fetch_product_media_for_products(productos_raw)
+    if wants_photos and not media_rows:
+        prev_media = memory.get("last_media_rows")
+        if isinstance(prev_media, list) and prev_media:
+            media_rows = [m for m in prev_media if isinstance(m, dict)]
+
+    memory_for_prompt = {
+        "ultimo_mensaje_cliente": memory.get("last_user_text", ""),
+        "ultimo_resumen_tema": memory.get("last_topic", ""),
+        "ultimo_producto_urls": memory.get("last_product_urls", []),
+        "ultimo_categoria_urls": memory.get("last_category_urls", []),
+    }
     should_introduce_ai_identity = conversation_id not in _introduced_conversations
     reply = gemini.compose_final_reply(
         text,
@@ -710,6 +753,7 @@ async def process_conversation(
         images,
         fragmentos,
         should_introduce_ai_identity,
+        memory_for_prompt,
     )
     adjuntos: list[str] = []
     if media_rows and _quiere_fotos_desde_texto_o_extraccion(text, extracted):
@@ -717,6 +761,15 @@ async def process_conversation(
         adjuntos = _urls_media_relevantes_para_enviar(media_rows, ranked_products=ranked)
     await send_chatwoot_message(conversation_id, account_id, reply, adjuntos or None)
     _introduced_conversations.add(conversation_id)
+    _conversation_memory[conversation_id] = {
+        "last_user_text": text,
+        "last_terms": terms,
+        "last_productos_raw": productos_raw[:15],
+        "last_media_rows": media_rows[:20],
+        "last_product_urls": [p.get("url_detalle_web") for p in productos if p.get("url_detalle_web")][:5],
+        "last_category_urls": [c.get("url_categoria_web") for c in categorias_relacionadas if c.get("url_categoria_web")][:5],
+        "last_topic": (extracted.get("tipo_producto") or ""),
+    }
 
 
 async def on_debounced_flush(conversation_key: Any, buf: AccumulatedMessage) -> None:

@@ -115,6 +115,7 @@ class GeminiService:
         image_urls: list[str],
         fragmentos_en_este_lote: int,
         should_introduce_ai_identity: bool,
+        conversation_memory: dict[str, Any] | None = None,
     ) -> str:
         """Paso C: contexto + resultados de BD -> respuesta al cliente."""
         ctx = {
@@ -124,12 +125,14 @@ class GeminiService:
             "productos_encontrados": productos_db,
             "categorias_relacionadas": categorias_relacionadas,
             "medios_de_producto": product_media,
+            "memoria_conversacion": conversation_memory or {},
         }
         prompt = (
             f"{RESPONSE_SYSTEM}\n\n"
             "Redacta la respuesta al cliente usando el contexto siguiente. "
             "Si fragmentos_acumulados_en_este_lote es mayor que 1, asume seguimiento inmediato y evita saludo inicial. "
             f"Identidad en esta respuesta: {'PRESENTARTE como la Inteligencia Artificial de Guerra Laser' if should_introduce_ai_identity else 'NO presentarte de nuevo como IA; continúa natural'} . "
+            "Si el cliente escribe algo corto de seguimiento (ej: 'tendrás fotos?', 'precio?', 'y compatibilidad?'), usa primero la memoria_conversacion y productos previos antes de pedirle que repita datos. "
             "Si no hay productos pero sí categorías con url_categoria_web, orienta con el enlace de la categoría. "
             "Si el catálogo está vacío, indica que no hubo coincidencias y pide datos o ofrece asesoría sin inventar referencias.\n\n"
             f"CONTEXTO (JSON):\n{json.dumps(ctx, ensure_ascii=False, default=str)}"
