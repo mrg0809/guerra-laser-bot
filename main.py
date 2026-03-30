@@ -55,6 +55,7 @@ _supabase: Client | None = None
 _gemini: GeminiService | None = None
 debouncer = ConversationDebouncer(delay_seconds=DEBOUNCE_SECONDS)
 _handover_conversations: set[int] = set()
+_introduced_conversations: set[int] = set()
 
 
 def get_supabase() -> Client:
@@ -283,6 +284,97 @@ def _urls_media_para_enviar(media_rows: list[dict[str, Any]], max_n: int = 5) ->
             out.append(u.strip())
         if len(out) >= max_n:
             break
+    return out
+
+
+def _rank_productos_por_relevancia(
+    productos: list[dict[str, Any]],
+    terms: list[str],
+    user_text: str,
+) -> list[tuple[str, int]]:
+    tokens = re.findall(r"[a-zA-Z0-9]+", (user_text or "").lower())
+    tokens = [t for t in tokens if len(t) >= 3][:10]
+    keys = [k.lower().strip() for k in terms if isinstance(k, str)]
+    keys.extend(tokens)
+    keys = list(dict.fromkeys([k for k in keys if k]))
+    if not keys:
+        return [(str(p.get("id")), 0) for p in productos if p.get("id") is not None]
+
+    scored: list[tuple[str, int]] = []
+    for p in productos:
+        pid = p.get("id")
+        if pid is None:
+            continue
+        searchable = " ".join(
+            str(p.get(k) or "")
+            for k in (COL_NOMBRE, COL_DESC, COL_SKU, COL_SLUG, "name", "description", "sku", "slug")
+        ).lower()
+        score = 0
+        for key in keys:
+            if key in searchable:
+                score += 2
+        scored.append((str(pid), score))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    ranked = [(pid, score) for pid, score in scored if score > 0]
+    if not ranked:
+        ranked = scored
+    return ranked
+
+
+def _urls_media_relevantes_para_enviar(
+    media_rows: list[dict[str, Any]],
+    ranked_products: list[tuple[str, int]],
+    max_n: int = 5,
+    max_products: int = 2,
+    dominant_max_n: int = 3,
+) -> list[str]:
+    if not media_rows:
+        return []
+
+    by_product: dict[str, list[dict[str, Any]]] = {}
+    for row in media_rows:
+        pid = row.get("product_id")
+        if pid is None:
+            continue
+        key = str(pid)
+        by_product.setdefault(key, []).append(row)
+
+    # Regla de producto dominante:
+    # si el top supera claramente al segundo (>=2 puntos de diferencia), enviar solo fotos del top.
+    top_pid = ranked_products[0][0] if ranked_products else None
+    top_score = ranked_products[0][1] if ranked_products else 0
+    second_score = ranked_products[1][1] if len(ranked_products) > 1 else -1
+    is_dominant = bool(top_pid) and (top_score > 0) and (top_score - second_score >= 2)
+    if is_dominant and top_pid is not None:
+        dominant_rows = by_product.get(top_pid) or []
+        dominant_urls: list[str] = []
+        for r in dominant_rows:
+            u = r.get("url") or r.get("thumbnail_url")
+            if u and isinstance(u, str) and u not in dominant_urls:
+                dominant_urls.append(u.strip())
+            if len(dominant_urls) >= dominant_max_n:
+                break
+        if dominant_urls:
+            return dominant_urls
+
+    out: list[str] = []
+    used_products = 0
+    for pid, _score in ranked_products:
+        if used_products >= max_products:
+            break
+        rows = by_product.get(pid) or []
+        if not rows:
+            continue
+        used_products += 1
+        for r in rows:
+            u = r.get("url") or r.get("thumbnail_url")
+            if u and isinstance(u, str) and u not in out:
+                out.append(u.strip())
+            if len(out) >= max_n:
+                return out
+
+    if not out:
+        return _urls_media_para_enviar(media_rows, max_n=max_n)
     return out
 
 
@@ -608,6 +700,7 @@ async def process_conversation(
     categorias_relacionadas = _merge_categorias_por_id(categorias_de_productos + categorias_por_terminos)
 
     media_rows = fetch_product_media_for_products(productos_raw)
+    should_introduce_ai_identity = conversation_id not in _introduced_conversations
     reply = gemini.compose_final_reply(
         text,
         extracted,
@@ -616,11 +709,14 @@ async def process_conversation(
         media_rows,
         images,
         fragmentos,
+        should_introduce_ai_identity,
     )
     adjuntos: list[str] = []
     if media_rows and _quiere_fotos_desde_texto_o_extraccion(text, extracted):
-        adjuntos = _urls_media_para_enviar(media_rows)
+        ranked = _rank_productos_por_relevancia(productos_raw, terms, text)
+        adjuntos = _urls_media_relevantes_para_enviar(media_rows, ranked_products=ranked)
     await send_chatwoot_message(conversation_id, account_id, reply, adjuntos or None)
+    _introduced_conversations.add(conversation_id)
 
 
 async def on_debounced_flush(conversation_key: Any, buf: AccumulatedMessage) -> None:

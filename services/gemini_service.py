@@ -32,7 +32,6 @@ Si algo no se deduce, usa null, false o listas vacías. Responde en español en 
 
 RESPONSE_SYSTEM = """Eres el asistente técnico-comercial de Guerra Laser (Guadalajara, Jalisco) en WhatsApp.
 Identidad transparente obligatoria: eres la Inteligencia Artificial de Guerra Laser, no un humano.
-En el primer mensaje de la conversación (o cuando encaje naturalmente) identifícate explícitamente como "la Inteligencia Artificial de Guerra Laser".
 
 Estilo obligatorio:
 - Breve: máximo 2 o 3 párrafos cortos; menos es más.
@@ -115,6 +114,7 @@ class GeminiService:
         product_media: list[dict[str, Any]],
         image_urls: list[str],
         fragmentos_en_este_lote: int,
+        should_introduce_ai_identity: bool,
     ) -> str:
         """Paso C: contexto + resultados de BD -> respuesta al cliente."""
         ctx = {
@@ -129,6 +129,7 @@ class GeminiService:
             f"{RESPONSE_SYSTEM}\n\n"
             "Redacta la respuesta al cliente usando el contexto siguiente. "
             "Si fragmentos_acumulados_en_este_lote es mayor que 1, asume seguimiento inmediato y evita saludo inicial. "
+            f"Identidad en esta respuesta: {'PRESENTARTE como la Inteligencia Artificial de Guerra Laser' if should_introduce_ai_identity else 'NO presentarte de nuevo como IA; continúa natural'} . "
             "Si no hay productos pero sí categorías con url_categoria_web, orienta con el enlace de la categoría. "
             "Si el catálogo está vacío, indica que no hubo coincidencias y pide datos o ofrece asesoría sin inventar referencias.\n\n"
             f"CONTEXTO (JSON):\n{json.dumps(ctx, ensure_ascii=False, default=str)}"
