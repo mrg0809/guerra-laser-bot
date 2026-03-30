@@ -316,11 +316,71 @@ def _intent_from_extraction(extracted: dict[str, Any], user_text: str) -> tuple[
         intent = raw_intent
 
     text = (user_text or "").lower()
-    if intent == "INFO":
-        if any(x in text for x in ("quiero comprar", "lo quiero", "donde deposito", "dónde deposito", "numero de cuenta", "número de cuenta")):
+    text_norm = (
+        text.replace("á", "a")
+        .replace("é", "e")
+        .replace("í", "i")
+        .replace("ó", "o")
+        .replace("ú", "u")
+    )
+    compra_strong_signals = (
+        "quiero comprar",
+        "lo quiero",
+        "pasame el numero de cuenta",
+        "pasame numero de cuenta",
+        "pásame el número de cuenta",
+        "numero de cuenta",
+        "número de cuenta",
+        "donde deposito",
+        "dónde deposito",
+        "te deposito",
+        "ya te deposite",
+        "ya te deposité",
+        "ya pague",
+        "ya pagué",
+        "como pago",
+        "cómo pago",
+    )
+    soporte_signals = (
+        "no funciona",
+        "garantia",
+        "garantía",
+        "molesto",
+        "falla",
+        "fallando",
+        "defecto",
+        "reclamo",
+        "queja",
+    )
+    inquiry_signals = (
+        "tienes ",
+        "tendra",
+        "tendrá",
+        "manejan ",
+        "hay ",
+        "precio",
+        "cuanto",
+        "cuánto",
+        "compatib",
+        "?",
+        "disponible",
+    )
+
+    has_soporte_signal = any(x in text_norm for x in soporte_signals)
+    has_compra_signal = any(x in text_norm for x in compra_strong_signals)
+
+    # Prioridad de seguridad: señales de soporte/queja siempre ganan.
+    if has_soporte_signal:
+        intent = "SOPORTE_QUEJA"
+    elif intent == "INFO":
+        if has_compra_signal:
             intent = "COMPRA"
-        elif any(x in text for x in ("no funciona", "garantia", "garantía", "molesto", "falla", "fallando", "defecto")):
-            intent = "SOPORTE_QUEJA"
+    else:
+        # Guardia: evita falso positivo de COMPRA cuando el cliente solo pregunta disponibilidad/precio/compatibilidad.
+        if intent == "COMPRA":
+            looks_like_inquiry = any(x in text_norm for x in inquiry_signals)
+            if not has_compra_signal and looks_like_inquiry:
+                intent = "INFO"
 
     motivo = str(extracted.get("motivo_handover") or "").strip()
     if not motivo and intent == "COMPRA":
