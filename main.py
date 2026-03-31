@@ -4,6 +4,7 @@ Bot Chatwoot + FastAPI: debounce, Gemini (extracción + respuesta), Supabase pro
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -591,17 +592,36 @@ async def send_chatwoot_message(
     headers = {"api_access_token": CHATWOOT_API_TOKEN}
     urls = [u for u in (attachment_image_urls or []) if u][:5]
 
+    # 1) Siempre enviar primero el texto como mensaje independiente.
+    payload = {"content": content, "private": False, "message_type": "outgoing"}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(url, json=payload, headers=headers)
+        if r.status_code >= 400:
+            logger.error("Chatwoot error %s: %s", r.status_code, r.text[:500])
+            return
+
     if not urls:
-        payload = {"content": content, "private": False, "message_type": "outgoing"}
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(url, json=payload, headers=headers)
-            if r.status_code >= 400:
-                logger.error("Chatwoot error %s: %s", r.status_code, r.text[:500])
         return
 
+    # 2) Enviar imágenes en segundo plano, una por mensaje, con retraso de seguridad.
+    asyncio.create_task(
+        _send_images_as_individual_messages(
+            url=url,
+            headers=headers,
+            image_urls=urls,
+            delay_seconds=1.5,
+        )
+    )
+
+
+async def _send_images_as_individual_messages(
+    url: str,
+    headers: dict[str, str],
+    image_urls: list[str],
+    delay_seconds: float = 1.5,
+) -> None:
     async with httpx.AsyncClient(timeout=90.0) as client:
-        file_fields: list[tuple[str, tuple[str, bytes, str]]] = []
-        for idx, img_url in enumerate(urls):
+        for idx, img_url in enumerate(image_urls):
             try:
                 ir = await client.get(img_url, follow_redirects=True)
                 ir.raise_for_status()
@@ -615,45 +635,21 @@ async def send_chatwoot_message(
                     ext = ".webp"
                 elif "gif" in ctype:
                     ext = ".gif"
-                file_fields.append(
-                    ("attachments[]", (f"media_{idx}{ext}", ir.content, ctype)),
-                )
+
+                data = {
+                    "content": "",
+                    "private": "false",
+                    "message_type": "outgoing",
+                }
+                files = [("attachments[]", (f"media_{idx}{ext}", ir.content, ctype))]
+                resp = await client.post(url, data=data, files=files, headers=headers)
+                if resp.status_code >= 400:
+                    logger.error("Chatwoot imagen error %s: %s", resp.status_code, resp.text[:500])
             except Exception as e:
-                logger.warning("No se pudo descargar imagen para adjuntar en Chatwoot: %s — %s", img_url, e)
+                logger.warning("No se pudo enviar imagen individual a Chatwoot: %s — %s", img_url, e)
 
-        if not file_fields:
-            extra = "\n\n" + "\n".join(urls) if content else "\n".join(urls)
-            payload = {
-                "content": (content or "Te comparto las referencias:") + extra,
-                "private": False,
-                "message_type": "outgoing",
-            }
-            r = await client.post(url, json=payload, headers=headers)
-            if r.status_code >= 400:
-                logger.error("Chatwoot error %s: %s", r.status_code, r.text[:500])
-            return
-
-        data = {
-            "content": content or "Te comparto las fotos del producto.",
-            "private": "false",
-            "message_type": "outgoing",
-        }
-        r = await client.post(url, data=data, files=file_fields, headers=headers)
-        if r.status_code >= 400:
-            logger.warning(
-                "Chatwoot multipart falló (%s), reintento solo texto+URLs: %s",
-                r.status_code,
-                r.text[:300],
-            )
-            extra = "\n\n" + "\n".join(urls)
-            payload = {
-                "content": (content or "") + extra,
-                "private": False,
-                "message_type": "outgoing",
-            }
-            r2 = await client.post(url, json=payload, headers=headers)
-            if r2.status_code >= 400:
-                logger.error("Chatwoot error %s: %s", r2.status_code, r2.text[:500])
+            if idx < len(image_urls) - 1:
+                await asyncio.sleep(delay_seconds)
 
 
 async def set_chatwoot_conversation_pending(conversation_id: int, account_id: int | None) -> bool:
