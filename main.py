@@ -8,11 +8,12 @@ import asyncio
 import logging
 import os
 import re
+import secrets
 from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from supabase import Client, create_client
 
@@ -31,6 +32,14 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 CHATWOOT_BASE_URL = os.getenv("CHATWOOT_BASE_URL", "").rstrip("/")
 CHATWOOT_API_TOKEN = os.getenv("CHATWOOT_API_TOKEN", "")
 CHATWOOT_ACCOUNT_ID = os.getenv("CHATWOOT_ACCOUNT_ID", "")
+# ID del usuario de Chatwoot asociado al mismo api_access_token del bot (opcional: se resuelve con GET /api/v1/profile)
+CHATWOOT_BOT_USER_ID_RAW = os.getenv("CHATWOOT_BOT_USER_ID", "").strip()
+# IDs de usuario cuyos mensajes salientes NO silencian al bot (p. ej. automatización/bienvenida con otra cuenta)
+CHATWOOT_IGNORE_OUTBOUND_USER_IDS: set[int] = set()
+for _part in (os.getenv("CHATWOOT_IGNORE_OUTBOUND_USER_IDS") or "").split(","):
+    _p = _part.strip()
+    if _p.isdigit():
+        CHATWOOT_IGNORE_OUTBOUND_USER_IDS.add(int(_p))
 
 PRODUCTOS_TABLE = os.getenv("PRODUCTOS_TABLE", "productos")
 PRODUCT_MEDIA_TABLE = os.getenv("PRODUCT_MEDIA_TABLE", "product_media")
@@ -51,13 +60,162 @@ PUBLIC_PRODUCT_PATH_TEMPLATE = os.getenv("PUBLIC_PRODUCT_PATH_TEMPLATE", "/produ
 PUBLIC_CATEGORY_PATH_TEMPLATE = os.getenv("PUBLIC_CATEGORY_PATH_TEMPLATE", "/categorias/{slug}")
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+BOT_CONTROL_TOKEN = os.getenv("BOT_CONTROL_TOKEN", "").strip()
 
 _supabase: Client | None = None
 _gemini: GeminiService | None = None
 debouncer = ConversationDebouncer(delay_seconds=DEBOUNCE_SECONDS)
 _handover_conversations: set[int] = set()
+_manual_pause_conversations: set[int] = set()
+# Cliente ya envió al menos un mensaje en esta conversación (evita silenciar el bot por bienvenidas automáticas)
+_contact_has_spoken: set[int] = set()
+# Un agente humano ya escribió al cliente (mensaje saliente); el bot deja de contestar sin cerrar la conversación
+_human_agent_spoke: set[int] = set()
+_bot_user_id_cache: int | None = None
 _introduced_conversations: set[int] = set()
 _conversation_memory: dict[int, dict[str, Any]] = {}
+
+
+def _is_incoming_message(msg: dict[str, Any], body: dict[str, Any]) -> bool:
+    mt = msg.get("message_type")
+    if body.get("message_type") == "outgoing" or mt == "outgoing" or mt == 1:
+        return False
+    if body.get("message_type") == "incoming" or mt == "incoming" or mt == 0:
+        return True
+    sender = msg.get("sender") or {}
+    if sender.get("type") == "contact":
+        return True
+    return False
+
+
+def get_bot_user_id() -> int | None:
+    """Usuario de Chatwoot que envía mensajes con CHATWOOT_API_TOKEN (para ignorar sus propios mensajes)."""
+    global _bot_user_id_cache
+    if _bot_user_id_cache is not None:
+        return _bot_user_id_cache
+    if CHATWOOT_BOT_USER_ID_RAW:
+        try:
+            _bot_user_id_cache = int(CHATWOOT_BOT_USER_ID_RAW)
+            return _bot_user_id_cache
+        except ValueError:
+            logger.warning("CHATWOOT_BOT_USER_ID inválido; se intentará /api/v1/profile")
+    if not CHATWOOT_BASE_URL or not CHATWOOT_API_TOKEN:
+        return None
+    try:
+        with httpx.Client(timeout=12.0) as client:
+            r = client.get(
+                f"{CHATWOOT_BASE_URL}/api/v1/profile",
+                headers={"api_access_token": CHATWOOT_API_TOKEN},
+            )
+            r.raise_for_status()
+            data = r.json()
+            uid = data.get("id")
+            if uid is None and isinstance(data.get("payload"), dict):
+                uid = data["payload"].get("id")
+            if uid is not None:
+                _bot_user_id_cache = int(uid)
+                logger.info("Usuario bot Chatwoot resuelto (id=%s)", _bot_user_id_cache)
+                return _bot_user_id_cache
+    except Exception as e:
+        logger.warning("No se pudo resolver usuario bot vía /api/v1/profile: %s", e)
+    return None
+
+
+def _parse_conversation_id_from_webhook(body: dict[str, Any]) -> int | None:
+    msg = body.get("message") or body
+    conversation = body.get("conversation") or msg.get("conversation") or {}
+    conv_id = conversation.get("id") or body.get("conversation_id") or msg.get("conversation_id")
+    if conv_id is None:
+        return None
+    try:
+        return int(conv_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def record_contact_spoke_from_webhook(body: dict[str, Any]) -> None:
+    """Marca que el cliente ya escribió (necesario para no confundir bienvenidas automáticas con agente humano)."""
+    if (body.get("event") or "").lower() != "message_created":
+        return
+    msg = body.get("message") or body
+    if not _is_incoming_message(msg, body):
+        return
+    conv_int = _parse_conversation_id_from_webhook(body)
+    if conv_int is None:
+        return
+    _contact_has_spoken.add(conv_int)
+
+
+def record_human_agent_outbound_from_webhook(body: dict[str, Any]) -> None:
+    """
+    Si un agente humano envía un mensaje público al cliente, el bot deja de intervenir.
+    No cierra la conversación ni cambia estado en Chatwoot.
+    """
+    if (body.get("event") or "").lower() != "message_created":
+        return
+    msg = body.get("message") or body
+    if msg.get("private"):
+        return
+
+    mt = msg.get("message_type")
+    is_outgoing = mt == 1 or mt == "outgoing" or body.get("message_type") == "outgoing"
+    if not is_outgoing:
+        return
+
+    conv_int = _parse_conversation_id_from_webhook(body)
+    if conv_int is None:
+        return
+    # Bienvenidas/campañas antes de que el cliente escriba no deben silenciar al bot
+    if conv_int not in _contact_has_spoken:
+        return
+
+    sender = msg.get("sender") or {}
+    stype = (sender.get("type") or "").lower()
+    if stype not in ("user", "agent"):
+        return
+
+    bot_uid = get_bot_user_id()
+    if bot_uid is None:
+        logger.warning(
+            "No se pudo determinar el usuario del bot; configura CHATWOOT_BOT_USER_ID o revisa /api/v1/profile"
+        )
+        return
+
+    sid = sender.get("id")
+    if sid is None:
+        return
+    try:
+        sender_id = int(sid)
+    except (TypeError, ValueError):
+        return
+    if sender_id == bot_uid:
+        return
+    if sender_id in CHATWOOT_IGNORE_OUTBOUND_USER_IDS:
+        return
+
+    _human_agent_spoke.add(conv_int)
+    logger.info(
+        "Bot desactivado en conversación %s: un agente humano (user id=%s) ya escribió al cliente",
+        conv_int,
+        sender_id,
+    )
+
+
+async def verify_bot_control_token(
+    authorization: str | None = Header(None),
+) -> None:
+    """Protege POST /bot/conversations/.../pause|resume con Authorization: Bearer <BOT_CONTROL_TOKEN>."""
+    if not BOT_CONTROL_TOKEN:
+        raise HTTPException(status_code=503, detail="BOT_CONTROL_TOKEN no configurado")
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Authorization: Bearer <token> requerido",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = authorization[7:].strip()
+    if not secrets.compare_digest(token, BOT_CONTROL_TOKEN):
+        raise HTTPException(status_code=401, detail="Token inválido")
 
 
 def get_supabase() -> Client:
@@ -503,18 +661,6 @@ def _intent_from_extraction(extracted: dict[str, Any], user_text: str) -> tuple[
     return intent, motivo
 
 
-def _is_incoming_message(msg: dict[str, Any], body: dict[str, Any]) -> bool:
-    mt = msg.get("message_type")
-    if body.get("message_type") == "outgoing" or mt == "outgoing" or mt == 1:
-        return False
-    if body.get("message_type") == "incoming" or mt == "incoming" or mt == 0:
-        return True
-    sender = msg.get("sender") or {}
-    if sender.get("type") == "contact":
-        return True
-    return False
-
-
 def parse_chatwoot_incoming(body: dict[str, Any]) -> tuple[str | None, int | None, int | None, list[str]]:
     """
     Devuelve (texto, conversation_id, account_id, urls_imagen).
@@ -682,6 +828,19 @@ async def process_conversation(
     account_id: int | None,
     accumulated: AccumulatedMessage,
 ) -> None:
+    if conversation_id in _manual_pause_conversations:
+        logger.info("Omitiendo respuesta: conversación %s con bot pausado manualmente", conversation_id)
+        return
+    if conversation_id in _human_agent_spoke:
+        logger.info(
+            "Omitiendo respuesta: conversación %s con agente humano ya activo",
+            conversation_id,
+        )
+        return
+    if conversation_id in _handover_conversations:
+        logger.info("Omitiendo respuesta: conversación %s en handover (COMPRA/SOPORTE)", conversation_id)
+        return
+
     text = accumulated.merge_text()
     images = list(accumulated.image_urls)
     fragmentos = len(accumulated.texts) if accumulated.texts else 1
@@ -788,6 +947,41 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/bot/conversations/{conversation_id}/pause")
+async def bot_pause_conversation(
+    conversation_id: int,
+    _auth: None = Depends(verify_bot_control_token),
+) -> dict[str, Any]:
+    """Detiene al bot en esta conversación para que un agente humano escriba sin interferencia."""
+    _manual_pause_conversations.add(conversation_id)
+    logger.info("Bot pausado manualmente para conversación %s (agente humano toma el chat)", conversation_id)
+    return {"ok": True, "conversation_id": conversation_id, "paused": True}
+
+
+@app.post("/bot/conversations/{conversation_id}/resume")
+async def bot_resume_conversation(
+    conversation_id: int,
+    _auth: None = Depends(verify_bot_control_token),
+) -> dict[str, Any]:
+    """Vuelve a permitir respuestas automáticas del bot en esta conversación."""
+    _manual_pause_conversations.discard(conversation_id)
+    logger.info("Bot reanudado para conversación %s", conversation_id)
+    return {"ok": True, "conversation_id": conversation_id, "paused": False}
+
+
+@app.get("/bot/conversations/{conversation_id}/status")
+async def bot_conversation_status(
+    conversation_id: int,
+    _auth: None = Depends(verify_bot_control_token),
+) -> dict[str, Any]:
+    return {
+        "conversation_id": conversation_id,
+        "paused_manual": conversation_id in _manual_pause_conversations,
+        "handover_auto": conversation_id in _handover_conversations,
+        "human_agent_active": conversation_id in _human_agent_spoke,
+    }
+
+
 @app.post("/webhook")
 async def webhook(request: Request) -> JSONResponse:
     try:
@@ -795,16 +989,22 @@ async def webhook(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
 
+    record_contact_spoke_from_webhook(body)
+    record_human_agent_outbound_from_webhook(body)
+
     text, conv_id, acc_id, image_urls = parse_chatwoot_incoming(body)
     if conv_id is None:
         return JSONResponse({"ok": True, "ignored": True, "reason": "no conversation"})
-    conversation_obj = body.get("conversation") or (body.get("message") or {}).get("conversation") or {}
-    conv_status = (conversation_obj.get("status") or "").lower()
-    if conv_status == "pending":
-        _handover_conversations.add(conv_id)
-        return JSONResponse({"ok": True, "ignored": True, "reason": "pending_human"})
+    # NO usar conversation.status == "pending" como señal de handover humano:
+    # en Chatwoot/WhatsApp "pending" es frecuente en conversaciones nuevas o en cola,
+    # no equivale a "un agente tomó el chat". El silencio del bot solo aplica si
+    # nosotros marcamos traspaso explícito (COMPRA/SOPORTE) vía _handover_conversations.
     if conv_id in _handover_conversations:
         return JSONResponse({"ok": True, "ignored": True, "reason": "handover_active"})
+    if conv_id in _human_agent_spoke:
+        return JSONResponse({"ok": True, "ignored": True, "reason": "human_agent_active"})
+    if conv_id in _manual_pause_conversations:
+        return JSONResponse({"ok": True, "ignored": True, "reason": "bot_paused_manual"})
     if not text and not image_urls:
         return JSONResponse({"ok": True, "ignored": True, "reason": "empty message"})
 
