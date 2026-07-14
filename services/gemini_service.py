@@ -1,4 +1,4 @@
-"""Gemini 1.5 Flash: extracción técnica (Paso A) y redacción final (Paso C)."""
+"""Gemini via google-genai: extracción técnica (Paso A) y redacción final (Paso C)."""
 
 from __future__ import annotations
 
@@ -7,12 +7,15 @@ import logging
 import os
 from typing import Any
 
-import google.generativeai as genai
 import httpx
+from google import genai
+from google.genai import types
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Timeout HTTP del SDK en milisegundos (evita congelar el proceso)
+GEMINI_TIMEOUT_MS = int(os.getenv("GEMINI_TIMEOUT_MS", "30000"))
 
 EXTRACTION_SYSTEM = """Eres un ingeniero de refacciones para máquinas láser (Guerra Laser, Guadalajara).
 Analiza el mensaje del cliente y las imágenes si las hay. Devuelve SOLO un JSON válido con esta forma:
@@ -44,15 +47,33 @@ Estilo obligatorio:
 Sé preciso con medidas y compatibilidades; no inventes datos que no estén en el catálogo o en el mensaje del cliente."""
 
 
+def _fallback_extraction(raw: str = "", motivo: str = "") -> dict[str, Any]:
+    return {
+        "tipo_producto": None,
+        "marca_fuente": None,
+        "tecnologia_detectada": None,
+        "potencia_detectada": None,
+        "medidas_o_specs": [],
+        "terminos_busqueda": [],
+        "pide_fotos_o_ver_producto": False,
+        "intencion": "INFO",
+        "motivo_handover": motivo or "",
+        "notas_tecnicas": (raw[:2000] if raw else "Error o timeout con Gemini"),
+    }
+
+
 class GeminiService:
     def __init__(self, api_key: str, model_name: str | None = None) -> None:
         if not api_key:
             raise ValueError("GOOGLE_API_KEY es requerida")
-        genai.configure(api_key=api_key)
-        self._model = genai.GenerativeModel(model_name or MODEL_NAME)
+        self._client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
+        )
+        self._model_name = model_name or MODEL_NAME
 
-    def _fetch_images_sync(self, urls: list[str], timeout: float = 20.0) -> list[dict[str, Any]]:
-        parts: list[dict[str, Any]] = []
+    def _fetch_images_sync(self, urls: list[str], timeout: float = 10.0) -> list[types.Part]:
+        parts: list[types.Part] = []
         with httpx.Client(timeout=timeout, follow_redirects=True) as client:
             for url in urls:
                 try:
@@ -61,7 +82,7 @@ class GeminiService:
                     ctype = r.headers.get("content-type", "image/jpeg").split(";")[0].strip()
                     if not ctype.startswith("image/"):
                         ctype = "image/jpeg"
-                    parts.append({"mime_type": ctype, "data": r.content})
+                    parts.append(types.Part.from_bytes(data=r.content, mime_type=ctype))
                 except Exception as e:
                     logger.warning("No se pudo cargar imagen %s: %s", url, e)
         return parts
@@ -76,34 +97,43 @@ class GeminiService:
             f"Mensaje del cliente:\n{user_text or '(sin texto, solo imágenes)'}\n\n"
             "Extrae el JSON solicitado."
         )
-        image_parts = self._fetch_images_sync(image_urls)
-        generation_config = genai.GenerationConfig(
+        image_parts = self._fetch_images_sync(image_urls, timeout=10.0)
+        config = types.GenerateContentConfig(
             response_mime_type="application/json",
-            temperature=0.2,
+            system_instruction=EXTRACTION_SYSTEM,
+            temperature=0.1,
+            http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
         )
-        contents: list[Any] = [EXTRACTION_SYSTEM + "\n\n" + prompt]
+        contents: list[Any] = [prompt]
         contents.extend(image_parts)
-        response = self._model.generate_content(
-            contents,
-            generation_config=generation_config,
-        )
-        raw = (response.text or "").strip()
+
+        raw = ""
         try:
+            response = self._client.models.generate_content(
+                model=self._model_name,
+                contents=contents,
+                config=config,
+            )
+            raw = (response.text or "").strip()
             return json.loads(raw)
+        except TimeoutError:
+            logger.error(
+                "TIMEOUT: Gemini tardó demasiado en extract_technical_specs (>%sms)",
+                GEMINI_TIMEOUT_MS,
+            )
+            return _fallback_extraction(motivo="Timeout de Gemini en extracción")
+        except httpx.TimeoutException:
+            logger.error(
+                "TIMEOUT httpx: Gemini tardó demasiado en extract_technical_specs (>%sms)",
+                GEMINI_TIMEOUT_MS,
+            )
+            return _fallback_extraction(motivo="Timeout de Gemini en extracción")
         except json.JSONDecodeError:
             logger.warning("Gemini extracción no devolvió JSON válido: %s", raw[:500])
-            return {
-                "tipo_producto": None,
-                "marca_fuente": None,
-                "tecnologia_detectada": None,
-                "potencia_detectada": None,
-                "medidas_o_specs": [],
-                "terminos_busqueda": [],
-                "pide_fotos_o_ver_producto": False,
-                "intencion": "INFO",
-                "motivo_handover": "",
-                "notas_tecnicas": raw[:2000],
-            }
+            return _fallback_extraction(raw=raw)
+        except Exception as e:
+            logger.error("Error en extract_technical_specs: %s", e)
+            return _fallback_extraction(raw=raw, motivo="Error en backend con Gemini")
 
     def compose_final_reply(
         self,
@@ -128,7 +158,6 @@ class GeminiService:
             "memoria_conversacion": conversation_memory or {},
         }
         prompt = (
-            f"{RESPONSE_SYSTEM}\n\n"
             "Redacta la respuesta al cliente usando el contexto siguiente. "
             "Si fragmentos_acumulados_en_este_lote es mayor que 1, asume seguimiento inmediato y evita saludo inicial. "
             f"Identidad en esta respuesta: {'PRESENTARTE como la Inteligencia Artificial de Guerra Laser' if should_introduce_ai_identity else 'NO presentarte de nuevo como IA; continúa natural'} . "
@@ -137,15 +166,37 @@ class GeminiService:
             "Si el catálogo está vacío, indica que no hubo coincidencias y pide datos o ofrece asesoría sin inventar referencias.\n\n"
             f"CONTEXTO (JSON):\n{json.dumps(ctx, ensure_ascii=False, default=str)}"
         )
-        image_parts = self._fetch_images_sync(image_urls)
+        image_parts = self._fetch_images_sync(image_urls, timeout=10.0)
         contents: list[Any] = [prompt]
         contents.extend(image_parts)
-        generation_config = genai.GenerationConfig(temperature=0.4)
-        response = self._model.generate_content(
-            contents,
-            generation_config=generation_config,
+        config = types.GenerateContentConfig(
+            system_instruction=RESPONSE_SYSTEM,
+            temperature=0.4,
+            http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
         )
-        return (response.text or "").strip() or (
-            "Gracias por escribirnos. En este momento no pude generar una respuesta; "
-            "un asesor de Guerra Laser te contactará en breve."
+        try:
+            response = self._client.models.generate_content(
+                model=self._model_name,
+                contents=contents,
+                config=config,
+            )
+            text = (response.text or "").strip()
+            if text:
+                return text
+        except TimeoutError:
+            logger.error(
+                "TIMEOUT: Gemini tardó demasiado en compose_final_reply (>%sms)",
+                GEMINI_TIMEOUT_MS,
+            )
+        except httpx.TimeoutException:
+            logger.error(
+                "TIMEOUT httpx: Gemini tardó demasiado en compose_final_reply (>%sms)",
+                GEMINI_TIMEOUT_MS,
+            )
+        except Exception as e:
+            logger.error("Error al componer respuesta final (Paso C): %s", e)
+
+        return (
+            "Gracias por tu paciencia. En este momento presenté un pequeño inconveniente técnico "
+            "para procesar la solicitud, pero un asesor humano de Guerra Laser te atenderá de inmediato."
         )
